@@ -292,6 +292,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         err = hipHostRegister((void *)reg_addr,
                                (size_t)reg_bytes,
                                hipHostRegisterMapped | hipHostRegisterReadOnly);
+        if (err == hipErrorInvalidValue || err == hipErrorNotSupported) {
+            (void)hipGetLastError();
+            err = hipHostRegister((void *)reg_addr, (size_t)reg_bytes, hipHostRegisterMapped);
+        }
         if (err == hipSuccess) {
             err = hipHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == hipSuccess && reg_dev) {
@@ -1454,8 +1458,15 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+    /* Try with ReadOnly flag first; fall back to plain Mapped if not supported.
+     * hipHostRegisterReadOnly can fail with hipErrorInvalidValue on some ROCm
+     * builds even though the operation itself is valid. */
     hipError_t err = hipHostRegister((void *)model_map, (size_t)model_size,
                                        hipHostRegisterMapped | hipHostRegisterReadOnly);
+    if (err == hipErrorInvalidValue || err == hipErrorNotSupported) {
+        (void)hipGetLastError();
+        err = hipHostRegister((void *)model_map, (size_t)model_size, hipHostRegisterMapped);
+    }
     if (err == hipSuccess) {
         void *dev = NULL;
         err = hipHostGetDevicePointer(&dev, (void *)model_map, 0);
@@ -1471,6 +1482,19 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     } else {
         fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", hipGetErrorString(err));
         (void)hipGetLastError();
+        /* On HSA unified memory (e.g., Strix Halo), the CPU mapping is already
+         * device-accessible without prior registration.  Try the pointer lookup
+         * directly; if it works we can skip the VRAM copy path entirely. */
+        void *dev = NULL;
+        hipError_t hsa_err = hipHostGetDevicePointer(&dev, (void *)model_map, 0);
+        if (hsa_err == hipSuccess && dev) {
+            g_model_device_base = (const char *)dev;
+            g_model_registered = 1;
+            fprintf(stderr, "ds4: HSA direct model access enabled (%.2f GiB)\n",
+                    (double)model_size / 1073741824.0);
+        } else {
+            (void)hipGetLastError();
+        }
     }
     return 1;
 }
@@ -1649,25 +1673,30 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     uint64_t tok = (uint64_t)blockIdx.y;
     if (row >= out_dim || tok >= n_tok) return;
 
-    __shared__ float partial[32];
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
-    const uint64_t chunk = (in_dim + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk;
-    uint64_t k1 = k0 + chunk;
-    if (k1 > in_dim) k1 = in_dim;
-    const __half *wr = w + row * in_dim;
-    const float *xr = x + tok * in_dim;
+    // Vectorized half2+float2 loads: each thread processes a contiguous chunk
+    // of in_dim/2 half2 pairs, then we reduce across the wave32 with shuffles.
+    const uint64_t h2_count = in_dim >> 1;
+    const uint64_t chunk2 = (h2_count + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk2;
+    uint64_t k1 = k0 + chunk2;
+    if (k1 > h2_count) k1 = h2_count;
+    const __half2 *wr2 = (const __half2 *)(w + row * in_dim);
+    const float2  *xr2 = (const float2  *)(x + tok * in_dim);
     for (uint64_t i = k0; i < k1; i++) {
-        sum += __half2float(wr[i]) * xr[i];
+        __half2 wv = wr2[i];
+        float2  xv = xr2[i];
+        sum += __half2float(wv.x) * xv.x + __half2float(wv.y) * xv.y;
     }
-    partial[tid] = sum;
-    __syncthreads();
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint32_t i = 0; i < 32u; i++) total += partial[i];
-        out[tok * out_dim + row] = total;
+    // Scalar tail for odd in_dim (rare; all DS4 Flash dims are even)
+    if (tid == 0 && (in_dim & 1u)) {
+        sum += __half2float(w[row * in_dim + in_dim - 1]) * x[tok * in_dim + in_dim - 1];
     }
+    // Wave32 warp-shuffle reduction — no shared memory or syncthreads needed
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0) out[tok * out_dim + row] = sum;
 }
 
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
@@ -1682,34 +1711,40 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
     uint64_t row = (uint64_t)blockIdx.x;
     if (row >= out0_dim && row >= out1_dim) return;
 
-    __shared__ float partial0[32];
-    __shared__ float partial1[32];
     const uint32_t tid = threadIdx.x;
     float sum0 = 0.0f;
     float sum1 = 0.0f;
-    const uint64_t chunk = (in_dim + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk;
-    uint64_t k1 = k0 + chunk;
-    if (k1 > in_dim) k1 = in_dim;
-    const __half *wr0 = row < out0_dim ? w0 + row * in_dim : w0;
-    const __half *wr1 = row < out1_dim ? w1 + row * in_dim : w1;
+    const uint64_t h2_count = in_dim >> 1;
+    const uint64_t chunk2 = (h2_count + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk2;
+    uint64_t k1 = k0 + chunk2;
+    if (k1 > h2_count) k1 = h2_count;
+    const __half2 *wr02 = (const __half2 *)(row < out0_dim ? w0 + row * in_dim : w0);
+    const __half2 *wr12 = (const __half2 *)(row < out1_dim ? w1 + row * in_dim : w1);
+    const float2  *xr2  = (const float2  *)(x);
     for (uint64_t i = k0; i < k1; i++) {
-        const float xv = x[i];
-        if (row < out0_dim) sum0 += __half2float(wr0[i]) * xv;
-        if (row < out1_dim) sum1 += __half2float(wr1[i]) * xv;
-    }
-    partial0[tid] = sum0;
-    partial1[tid] = sum1;
-    __syncthreads();
-    if (tid == 0) {
-        float total0 = 0.0f;
-        float total1 = 0.0f;
-        for (uint32_t i = 0; i < 32u; i++) {
-            total0 += partial0[i];
-            total1 += partial1[i];
+        float2 xv = xr2[i];
+        if (row < out0_dim) {
+            __half2 wv = wr02[i];
+            sum0 += __half2float(wv.x) * xv.x + __half2float(wv.y) * xv.y;
         }
-        if (row < out0_dim) out0[row] = total0;
-        if (row < out1_dim) out1[row] = total1;
+        if (row < out1_dim) {
+            __half2 wv = wr12[i];
+            sum1 += __half2float(wv.x) * xv.x + __half2float(wv.y) * xv.y;
+        }
+    }
+    if (tid == 0 && (in_dim & 1u)) {
+        float xv = x[in_dim - 1];
+        if (row < out0_dim) sum0 += __half2float(w0[row * in_dim + in_dim - 1]) * xv;
+        if (row < out1_dim) sum1 += __half2float(w1[row * in_dim + in_dim - 1]) * xv;
+    }
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1) {
+        sum0 += __shfl_down(sum0, offset);
+        sum1 += __shfl_down(sum1, offset);
+    }
+    if (tid == 0) {
+        if (row < out0_dim) out0[row] = sum0;
+        if (row < out1_dim) out1[row] = sum1;
     }
 }
 
@@ -1727,18 +1762,20 @@ __global__ static void matmul_f32_kernel(
     float sum = 0.0f;
     const float *wr = w + row * in_dim;
     const float *xr = x + tok * in_dim;
-    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x)
         sum += wr[i] * xr[i];
-    }
-
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
+    // Reduce within warp via shuffles, then accumulate 8 warp sums via shared memory.
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    __shared__ float warp_sums[8];
+    if ((threadIdx.x & 31u) == 0u)
+        warp_sums[threadIdx.x >> 5] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = warp_sums[0];
+        for (uint32_t i = 1u; i < 8u; i++) total += warp_sums[i];
+        out[tok * out_dim + row] = total;
     }
-    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
 __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n_embd, uint32_t n_hc) {
