@@ -39,7 +39,7 @@ endif
 
 .PHONY: all clean test cpu cuda-regression hip-unit-test
 
-all: ds4 ds4-server ds4-bench
+all: ds4 ds4-server ds4-bench hip-performance-benchmark
 
 ifeq ($(UNAME_S),Darwin)
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -141,5 +141,14 @@ endif
 test: ds4_test
 	./ds4_test
 
+tests/hip_performance_benchmark.o: tests/hip_performance_benchmark.cpp ds4_gpu.h
+	$(HIPCC) $(HIPCCFLAGS) -c -o $@ tests/hip_performance_benchmark.cpp
+
+tests/hip_performance_benchmark: tests/hip_performance_benchmark.o ds4_hip.o
+	$(HIPCC) $(HIPCCFLAGS) -o $@ $^ $(HIP_LDLIBS)
+
+hip-performance-benchmark: tests/hip_performance_benchmark
+	./tests/hip_performance_benchmark
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/hip_long_context_smoke tests/hip_long_context_smoke.o tests/hip_unit_test tests/hip_unit_test.o
+	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/hip_long_context_smoke tests/hip_long_context_smoke.o tests/hip_unit_test tests/hip_unit_test.o tests/hip_performance_benchmark tests/hip_performance_benchmark.o

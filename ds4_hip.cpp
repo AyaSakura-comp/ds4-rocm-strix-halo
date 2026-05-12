@@ -26,11 +26,10 @@
  * the same scalar loop — it is never actually called from host code. */
 __device__ static inline int __dp4a(int a, int b, int c) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    char4 va = {(char)(a & 0xff), (char)((a >> 8) & 0xff),
-                (char)((a >> 16) & 0xff), (char)((a >> 24) & 0xff)};
-    char4 vb = {(char)(b & 0xff), (char)((b >> 8) & 0xff),
-                (char)((b >> 16) & 0xff), (char)((b >> 24) & 0xff)};
-    return amd_mixed_dot(va, vb, c, false);
+    union { int i; char4 c4; } ua, ub;
+    ua.i = a;
+    ub.i = b;
+    return amd_mixed_dot(ua.c4, ub.c4, c, false);
 #else
     int r = c;
     for (int i = 0; i < 4; ++i) {
@@ -1473,7 +1472,11 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         if (err == hipSuccess && dev) {
             g_model_device_base = (const char *)dev;
             g_model_registered = 1;
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
+            int dev_id = 0;
+            (void)hipGetDevice(&dev_id);
+            (void)hipMemAdvise((void *)model_map, (size_t)model_size, hipMemAdviseSetReadMostly, dev_id);
+            (void)hipMemAdvise((void *)model_map, (size_t)model_size, hipMemAdviseSetCoarseGrain, dev_id);
+            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping (cached coarse-grained) for device access\n",
                     (double)model_size / 1073741824.0);
         } else {
             fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", hipGetErrorString(err));
@@ -1490,7 +1493,11 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         if (hsa_err == hipSuccess && dev) {
             g_model_device_base = (const char *)dev;
             g_model_registered = 1;
-            fprintf(stderr, "ds4: HSA direct model access enabled (%.2f GiB)\n",
+            int dev_id = 0;
+            (void)hipGetDevice(&dev_id);
+            (void)hipMemAdvise((void *)model_map, (size_t)model_size, hipMemAdviseSetReadMostly, dev_id);
+            (void)hipMemAdvise((void *)model_map, (size_t)model_size, hipMemAdviseSetCoarseGrain, dev_id);
+            fprintf(stderr, "ds4: HSA direct model access enabled (cached coarse-grained) (%.2f GiB)\n",
                     (double)model_size / 1073741824.0);
         } else {
             (void)hipGetLastError();
@@ -1675,25 +1682,20 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
 
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
-    // Vectorized half2+float2 loads: each thread processes a contiguous chunk
-    // of in_dim/2 half2 pairs, then we reduce across the wave32 with shuffles.
     const uint64_t h2_count = in_dim >> 1;
-    const uint64_t chunk2 = (h2_count + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk2;
-    uint64_t k1 = k0 + chunk2;
-    if (k1 > h2_count) k1 = h2_count;
     const __half2 *wr2 = (const __half2 *)(w + row * in_dim);
     const float2  *xr2 = (const float2  *)(x + tok * in_dim);
-    for (uint64_t i = k0; i < k1; i++) {
+
+    // Interleaved (coalesced) access: all threads in the warp read contiguous memory
+    for (uint64_t i = tid; i < h2_count; i += blockDim.x) {
         __half2 wv = wr2[i];
         float2  xv = xr2[i];
         sum += __half2float(wv.x) * xv.x + __half2float(wv.y) * xv.y;
     }
-    // Scalar tail for odd in_dim (rare; all DS4 Flash dims are even)
+    // Scalar tail for odd in_dim
     if (tid == 0 && (in_dim & 1u)) {
         sum += __half2float(w[row * in_dim + in_dim - 1]) * x[tok * in_dim + in_dim - 1];
     }
-    // Wave32 warp-shuffle reduction — no shared memory or syncthreads needed
     for (uint32_t offset = 16u; offset > 0u; offset >>= 1)
         sum += __shfl_down(sum, offset);
     if (tid == 0) out[tok * out_dim + row] = sum;
@@ -1707,34 +1709,34 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         const float *x,
         uint64_t in_dim,
         uint64_t out0_dim,
-        uint64_t out1_dim) {
+        uint64_t out1_dim,
+        uint64_t n_tok) {
     uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
     if (row >= out0_dim && row >= out1_dim) return;
+    if (tok >= n_tok) return;
 
     const uint32_t tid = threadIdx.x;
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     const uint64_t h2_count = in_dim >> 1;
-    const uint64_t chunk2 = (h2_count + 31u) / 32u;
-    const uint64_t k0 = (uint64_t)tid * chunk2;
-    uint64_t k1 = k0 + chunk2;
-    if (k1 > h2_count) k1 = h2_count;
-    const __half2 *wr02 = (const __half2 *)(row < out0_dim ? w0 + row * in_dim : w0);
-    const __half2 *wr12 = (const __half2 *)(row < out1_dim ? w1 + row * in_dim : w1);
-    const float2  *xr2  = (const float2  *)(x);
-    for (uint64_t i = k0; i < k1; i++) {
+    const __half2 *wr2_0 = row < out0_dim ? (const __half2 *)(w0 + row * in_dim) : NULL;
+    const __half2 *wr2_1 = row < out1_dim ? (const __half2 *)(w1 + row * in_dim) : NULL;
+    const float2  *xr2   = (const float2  *)(x + tok * in_dim);
+
+    for (uint64_t i = tid; i < h2_count; i += blockDim.x) {
         float2 xv = xr2[i];
-        if (row < out0_dim) {
-            __half2 wv = wr02[i];
+        if (wr2_0) {
+            __half2 wv = wr2_0[i];
             sum0 += __half2float(wv.x) * xv.x + __half2float(wv.y) * xv.y;
         }
-        if (row < out1_dim) {
-            __half2 wv = wr12[i];
+        if (wr2_1) {
+            __half2 wv = wr2_1[i];
             sum1 += __half2float(wv.x) * xv.x + __half2float(wv.y) * xv.y;
         }
     }
     if (tid == 0 && (in_dim & 1u)) {
-        float xv = x[in_dim - 1];
+        float xv = x[tok * in_dim + in_dim - 1];
         if (row < out0_dim) sum0 += __half2float(w0[row * in_dim + in_dim - 1]) * xv;
         if (row < out1_dim) sum1 += __half2float(w1[row * in_dim + in_dim - 1]) * xv;
     }
@@ -1743,8 +1745,8 @@ __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         sum1 += __shfl_down(sum1, offset);
     }
     if (tid == 0) {
-        if (row < out0_dim) out0[row] = sum0;
-        if (row < out1_dim) out1[row] = sum1;
+        if (row < out0_dim) out0[tok * out0_dim + row] = sum0;
+        if (row < out1_dim) out1[tok * out1_dim + row] = sum1;
     }
 }
 
@@ -2186,21 +2188,23 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
     const float *xr = x + (uint64_t)row * n;
     float *orow = out + (uint64_t)row * n;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = xr[i];
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+        sum += xr[i] * xr[i];
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    __shared__ float warp_sums[8];
+    if ((threadIdx.x & 31u) == 0u)
+        warp_sums[threadIdx.x >> 5] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = warp_sums[0];
+        for (uint32_t i = 1u; i < 8u; i++) total += warp_sums[i];
+        warp_sums[0] = rsqrtf(total / (float)n + eps);
     }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    __syncthreads();
+    float scale = warp_sums[0];
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
         orow[i] = xr[i] * scale;
-    }
 }
 
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
@@ -2209,21 +2213,23 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     const float *xr = x + (uint64_t)row * n;
     float *orow = out + (uint64_t)row * n;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = xr[i];
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+        sum += xr[i] * xr[i];
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    __shared__ float warp_sums[8];
+    if ((threadIdx.x & 31u) == 0u)
+        warp_sums[threadIdx.x >> 5] = sum;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = warp_sums[0];
+        for (uint32_t i = 1u; i < 8u; i++) total += warp_sums[i];
+        warp_sums[0] = rsqrtf(total / (float)n + eps);
     }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    __syncthreads();
+    float scale = warp_sums[0];
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
         orow[i] = xr[i] * scale * w[i];
-    }
 }
 
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
@@ -2523,8 +2529,8 @@ __global__ static void attention_prefill_raw_kernel(
     uint32_t raw_count = t + 1 < window ? t + 1 : window;
     uint32_t raw_start = t + 1 - raw_count;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    __shared__ float scores[256];
-    __shared__ float partial[128];
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
     float scale = rsqrtf((float)head_dim);
@@ -2586,7 +2592,7 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
-    __shared__ float scores[512];
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
@@ -5574,7 +5580,8 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         (const float *)x->ptr,
         in_dim,
         out_dim,
-        out_dim);
+        out_dim,
+        n_tok);
     return cuda_ok(hipGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
@@ -6194,12 +6201,11 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
-        window > 256) return 0;
+        raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    if (n_tokens > 1 && head_dim == 512 &&
+    if (n_tokens > 1 &&
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -6216,7 +6222,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    head_dim);
         return cuda_ok(hipGetLastError(), "attention raw window launch");
     }
-    if (g_cublas_ready && n_tokens > 1 && head_dim == 512 &&
+    if (g_cublas_ready && n_tokens > 1 &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") == NULL) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -7317,18 +7323,21 @@ __device__ static float dev_dot_q2_K_q8_K_block(const cuda_block_q2_K *x, const 
     const int8_t *q8 = y->qs;
     const uint8_t *sc = x->scales;
     int summs = 0;
+    #pragma unroll
     for (int j = 0; j < 16; j++) summs += y->bsums[j] * (sc[j] >> 4);
     const float dall = y->d * dev_f16_to_f32(x->d);
     const float dmin = y->d * dev_f16_to_f32(x->dmin);
     int isum = 0;
     int is = 0;
+    #pragma unroll
     for (int k = 0; k < CUDA_QK_K / 128; k++) {
         int shift = 0;
+        #pragma unroll
         for (int j = 0; j < 4; j++) {
-            int d = sc[is++] & 0x0f;
-            isum += d * dev_dot_q2_16(q2, q8, shift);
-            d = sc[is++] & 0x0f;
-            isum += d * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
+            int d0 = sc[is++] & 0x0f;
+            isum += d0 * dev_dot_q2_16(q2, q8, shift);
+            int d1 = sc[is++] & 0x0f;
+            isum += d1 * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
             shift += 2;
             q8 += 32;
         }
@@ -7488,7 +7497,6 @@ __device__ static float half_warp_sum_f32(float v, uint32_t lane16) {
 }
 
 __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
-    uint32_t mask = 0xffu << (threadIdx.x & 24u);
     for (int offset = 4; offset > 0; offset >>= 1) {
         v += __shfl_down(v, offset, 8);
     }
@@ -8501,18 +8509,36 @@ __global__ static void moe_down_qwarp32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim,
         uint32_t n_expert) {
+    // Shared memory cache for activations. Each block handles one (token, expert) pair.
+    // All 32 rows in the block share the same activations.
+    extern __shared__ cuda_block_q8_K smem_xq[];
+
+    uint32_t pair = blockIdx.y;
+    const cuda_block_q8_K *xq_glob = midq + (uint64_t)pair * midq_blocks;
+
+    // Collaborative load into shared memory
+    for (uint32_t i = threadIdx.x; i < midq_blocks; i += blockDim.x) {
+        smem_xq[i] = xq_glob[i];
+    }
+    __syncthreads();
+
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t pair = blockIdx.y;
     if (row >= out_dim) return;
+
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+
     const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
-    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
-    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+
+    // Use cached activations from shared memory
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+        acc += dev_dot_q2_K_q8_K_block(wr + b, smem_xq + b);
+    }
+
     acc = quarter_warp_sum_f32(acc, lane);
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
@@ -9688,7 +9714,8 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert);
             } else {
-                moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+                size_t smem_size = (size_t)midq_blocks * sizeof(cuda_block_q8_K);
+                moe_down_qwarp32_kernel<<<dgrid, 256, smem_size>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
