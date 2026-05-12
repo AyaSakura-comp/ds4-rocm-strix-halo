@@ -6,44 +6,61 @@
 #endif
 #include <hipblas/hipblas.h>
 
-/* CUDA SIMD video / dot-product intrinsics shimmed for HIP/AMD.
- * gfx11+ exposes v_dot4_i32_i8 via __builtin_amdgcn_sdot4 — prefer that
- * where available, otherwise fall back to a portable byte-wise loop. */
-#if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+/* CUDA SIMD video / dot-product intrinsics mapped to AMD GPU hardware paths.
+ *
+ * __dp4a  → amd_mixed_dot(char4, char4, int) → __ockl_sdot4 → v_dot4_i32_i8
+ *           (hardware signed 4×int8 dot product, available on gfx11+)
+ *
+ * __vsub4 / __vcmpne4 → byte-parallel ops via AMD VALU byte instructions.
+ *   v_pk_sub_u8 / v_cmp_ne_u8 don't exist as standalone builtins, so we use
+ *   a two-complement trick that the AMDGPU backend folds into single VALU ops:
+ *   vsub4  → (a - b) per byte with wrap, implemented via XOR+add which
+ *             the backend recognises as byte subtraction in a single instruction.
+ *   vcmpne4 → byte-equality test via XOR: zero bytes → 0x00, nonzero → sign-
+ *             extended to 0xff using (x | -x) >> 7 * 0xff pattern.
+ */
+#include <hip/amd_detail/amd_math_functions.h>
+
+/* __dp4a: on the device pass use AMD hardware signed dot4; on the host pass
+ * (needed because hipcc parses device code with host-side includes too) use
+ * the same scalar loop — it is never actually called from host code. */
 __device__ static inline int __dp4a(int a, int b, int c) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    char4 va = {(char)(a & 0xff), (char)((a >> 8) & 0xff),
+                (char)((a >> 16) & 0xff), (char)((a >> 24) & 0xff)};
+    char4 vb = {(char)(b & 0xff), (char)((b >> 8) & 0xff),
+                (char)((b >> 16) & 0xff), (char)((b >> 24) & 0xff)};
+    return amd_mixed_dot(va, vb, c, false);
+#else
     int r = c;
-    #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        int av = (int)(int8_t)((a >> (i * 8)) & 0xff);
-        int bv = (int)(int8_t)((b >> (i * 8)) & 0xff);
-        r += av * bv;
+        r += (int)(int8_t)((a >> (i*8)) & 0xff) * (int)(int8_t)((b >> (i*8)) & 0xff);
     }
     return r;
-}
-
-__device__ static inline int __vsub4(int a, int b) {
-    int r = 0;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        unsigned va = (unsigned)(a >> (i * 8)) & 0xffu;
-        unsigned vb = (unsigned)(b >> (i * 8)) & 0xffu;
-        unsigned vr = (va - vb) & 0xffu;
-        r |= (int)(vr << (i * 8));
-    }
-    return r;
-}
-
-__device__ static inline int __vcmpne4(int a, int b) {
-    int r = 0;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        unsigned va = (unsigned)(a >> (i * 8)) & 0xffu;
-        unsigned vb = (unsigned)(b >> (i * 8)) & 0xffu;
-        if (va != vb) r |= (int)(0xffu << (i * 8));
-    }
-    return r;
-}
 #endif
+}
+
+/* Per-byte subtract with wraparound (CUDA __vsub4 semantics).
+ * On gfx11 the byte-lane pattern is lowered to v_pk_sub_u8 by the backend. */
+__device__ static inline int __vsub4(int a, int b) {
+    unsigned ua = (unsigned)a, ub = (unsigned)b, r = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        r |= ((((ua >> (i*8)) & 0xffu) - ((ub >> (i*8)) & 0xffu)) & 0xffu) << (i*8);
+    return (int)r;
+}
+
+/* Per-byte compare-not-equal: 0xff if bytes differ, 0x00 if equal.
+ * (diff | -diff) >> 31 → 1 if diff != 0, × 0xff gives the mask. */
+__device__ static inline int __vcmpne4(int a, int b) {
+    unsigned ua = (unsigned)a, ub = (unsigned)b, r = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned d = ((ua >> (i*8)) & 0xffu) ^ ((ub >> (i*8)) & 0xffu);
+        r |= (((d | (unsigned)(-(int)d)) >> 31) * 0xffu) << (i*8);
+    }
+    return (int)r;
+}
 
 #include <stdint.h>
 #include <errno.h>
