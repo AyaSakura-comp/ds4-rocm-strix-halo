@@ -123,6 +123,7 @@ static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
 static int g_model_registered;
 static int g_model_device_owned;
+static void *g_model_host_alloc = NULL;  /* hipHostMalloc'd full-resident model buffer (DS4_HIP_LOAD_TO_MEMORY) */
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
 static int g_model_fd = -1;
@@ -1308,6 +1309,12 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)hipStreamDestroy(g_model_upload_stream);
         g_model_upload_stream = NULL;
     }
+    if (g_model_host_alloc) {
+        /* device_base is an alias of this pinned buffer, not a hipMalloc'd copy */
+        (void)hipHostFree(g_model_host_alloc);
+        g_model_host_alloc = NULL;
+        g_model_device_owned = 0;
+    }
     if (g_model_device_owned && g_model_device_base) {
         (void)hipFree((void *)g_model_device_base);
     }
@@ -1417,6 +1424,11 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
+    if (g_model_host_alloc) {
+        (void)hipHostFree(g_model_host_alloc);
+        g_model_host_alloc = NULL;
+        g_model_device_owned = 0;
+    }
     if (g_model_device_owned && g_model_device_base) {
         (void)hipFree((void *)g_model_device_base);
         g_model_device_owned = 0;
@@ -1431,6 +1443,49 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+
+    /* DS4_HIP_LOAD_TO_MEMORY: read the whole model into a pinned host buffer once
+     * (sequential read() => full SSD bandwidth), then expose it to the GPU with no
+     * copy.  On a UMA APU (Strix Halo) host and device share DRAM, so the pinned
+     * buffer IS device-accessible -- this avoids both the lazy/evictable mmap path
+     * and the redundant RAM->RAM hipMemcpy of DS4_HIP_COPY_MODEL. */
+    const char *load_mem_env = getenv("DS4_HIP_LOAD_TO_MEMORY");
+    if (load_mem_env && load_mem_env[0] && g_model_fd >= 0) {
+        void *host = NULL;
+        const double t0 = hip_wall_sec();
+        hipError_t err = hipHostMalloc(&host, (size_t)model_size, hipHostMallocMapped);
+        if (err == hipSuccess) {
+            fprintf(stderr, "ds4: ROCm loading %.2f GiB model into pinned memory via read()\n",
+                    (double)model_size / 1073741824.0);
+            if (hip_pread_full(g_model_fd, host, model_size, 0)) {
+                void *dev = NULL;
+                if (hipHostGetDevicePointer(&dev, host, 0) != hipSuccess || !dev) {
+                    (void)hipGetLastError();
+                    dev = host;  /* unified addressing: host pointer is device-usable */
+                }
+                g_model_host_alloc = host;
+                g_model_device_base = (const char *)dev;
+                g_model_device_owned = 1;  /* model is fully resident; use device_base directly */
+                int dev_id = 0;
+                (void)hipGetDevice(&dev_id);
+                (void)hipMemAdvise(host, (size_t)model_size, hipMemAdviseSetReadMostly, dev_id);
+                (void)hipMemAdvise(host, (size_t)model_size, hipMemAdviseSetCoarseGrain, dev_id);
+                const double t1 = hip_wall_sec();
+                const double dt = (t1 - t0) > 0.0 ? (t1 - t0) : 1e-9;
+                fprintf(stderr, "ds4: ROCm model fully resident in memory (%.2f GiB) in %.3fs (%.0f MB/s, no device copy)\n",
+                        (double)model_size / 1073741824.0, t1 - t0,
+                        (double)model_size / 1048576.0 / dt);
+                return 1;
+            }
+            fprintf(stderr, "ds4: ROCm model read() into host memory failed; falling back to mmap path\n");
+            (void)hipHostFree(host);
+            g_model_host_alloc = NULL;
+        } else {
+            fprintf(stderr, "ds4: ROCm pinned host alloc (%.2f GiB) failed: %s; falling back to mmap path\n",
+                    (double)model_size / 1073741824.0, hipGetErrorString(err));
+            (void)hipGetLastError();
+        }
+    }
 
     const char *copy_env = getenv("DS4_HIP_COPY_MODEL");
     if (copy_env && copy_env[0]) {

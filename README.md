@@ -129,6 +129,35 @@ The project includes a unified startup script that cleans up stale processes, fl
 
 This script is specifically tuned for hardware like the **AMD Strix Halo**, unsetting `DS4_HIP_COPY_MODEL` to enable **Zero-Copy HSA access**, which allows the GPU to read model weights directly from system RAM without duplication.
 
+### Model loading on unified memory (Strix Halo)
+
+Strix Halo is a **UMA (Unified Memory Architecture)** APU: the CPU and GPU share one
+pool of DRAM, and there is no discrete VRAM (the BIOS UMA carveout ROCm reports as
+"VRAM" is only ~512 MB — model weights actually live in GTT, which is system RAM).
+Because of this there is **no separate memory to copy weights *into***, so the HIP
+backend offers three loading strategies, selected by environment variable:
+
+| Mode | Env | What it does | Load time (84 GiB) | Use on Strix Halo? |
+| --- | --- | --- | --- | --- |
+| **Zero-copy** (default) | *(none set)* | `mmap` the GGUF, then `hipHostRegister` + `hipHostGetDevicePointer` so the GPU reads the same pages. No copy. Pages fault in lazily and are **evictable** under memory pressure. | seconds (lazy) | ✅ default |
+| **Load-to-memory** | `DS4_HIP_LOAD_TO_MEMORY=1` | `hipHostMalloc` one pinned buffer and `read()` the whole file into it sequentially (full SSD bandwidth), exposed to the GPU with **no copy** (UMA). Weights are **fully resident and non-evictable**. | ~22 s @ ~3.9 GB/s | ✅ recommended for steady-state serving |
+| **Device copy** | `DS4_HIP_COPY_MODEL=1` | `hipMalloc` an 84 GiB device buffer and `hipMemcpy` the model into it. | **>15 min, often never completes** | ❌ **do not use** |
+
+`DS4_HIP_COPY_MODEL` exists for discrete-GPU builds (CUDA / dGPU), where copying
+into VRAM is meaningful. **On a UMA APU it is pointless and pathological**: device
+memory *is* system RAM, so the copy is RAM→RAM, and during the copy you transiently
+need ~2× the model size (84 GiB destination + the mmap source) which thrashes page
+cache; worse, the giant `hipMemcpy` from pageable memory crawls through per-region
+KFD ioctls (the SSD sits ~2% utilised). Prefer **zero-copy** (default) or, if you
+want weights pinned and pre-faulted, **`DS4_HIP_LOAD_TO_MEMORY=1`**.
+
+> **Prefill chunk warning.** Keep `DS4_METAL_PREFILL_CHUNK` ≤ **2048** on ROCm /
+> Strix Halo (the engine default for prompts > 2048 is already 2048). A chunk of
+> **8192 hangs the GPU prefill kernel**: it dispatches a kernel that never signals
+> completion, so `hipDeviceSynchronize()` busy-spins forever in the HSA runtime
+> (one CPU core pegged, GPU idle, the prefill log frozen at `chunk 0/N (0.0%)`).
+> Short prompts never hit it; large prompts (e.g. a ~14 K-token agent prompt) do.
+
 ### Testing
 
 Once the server is listening, you can verify it with a `curl` request:
@@ -751,6 +780,47 @@ make test                  # ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
+
+## Strix Halo Rabbit Holes (lessons learned)
+
+Hard-won notes from bringing the ROCm backend up on an AMD Strix Halo APU
+(Radeon Graphics `gfx115x`, ROCm 7.2.2). These cost real time to diagnose, so
+they are recorded here to save the next person.
+
+- **Large prefill chunks hang the GPU, and it looks like everything else.**
+  `DS4_METAL_PREFILL_CHUNK=8192` dispatches a prefill kernel that never completes;
+  `ds4_gpu_end_commands()` (just `hipDeviceSynchronize()`) then busy-spins in the
+  HSA runtime. Symptoms *mimicked* an infinite kernel JIT and a deadlock-on-client-
+  disconnect — all three were the same bug. Diagnosis came from `gdb -p <pid>
+  -batch -ex "thread apply all bt"`: the hot thread was
+  `ds4_gpu_end_commands → libamdhip64 → libhsa-runtime64` (spinning) while the
+  request handler sat in `pthread_cond_wait`. Fix: chunk ≤ 2048.
+
+- **`DS4_HIP_COPY_MODEL` is a trap on UMA.** Copying weights "into the GPU" on a
+  shared-memory APU copies RAM onto itself, needs ~2× the model size transiently,
+  and the big pageable `hipMemcpy` crawls via per-region KFD ioctls (`ioctl(fd=5
+  /dev/kfd …)` in the backtrace) — the SSD is barely touched. Progress can be
+  watched via `/proc/<pid>/io` `read_bytes` (mmap faults don't show in `rchar`).
+  The right answer on UMA is to **not copy** — see `DS4_HIP_LOAD_TO_MEMORY`.
+
+- **`DS4_HIP_LOAD_TO_MEMORY` — the UMA-correct "everything in memory" loader.**
+  Added in `ds4_gpu_set_model_map()` (`ds4_hip.cpp`): `hipHostMalloc` a single
+  pinned buffer, `read()` the whole GGUF into it sequentially (~3.9 GB/s, ~22 s for
+  84 GiB), then hand the GPU a pointer to that same RAM via
+  `hipHostGetDevicePointer` — **no device copy**. Unlike the default mmap path the
+  pages are pinned (non-evictable, pre-faulted), and unlike `DS4_HIP_COPY_MODEL`
+  there is no redundant duplicate. Inference speed is essentially identical to
+  zero-copy (same physical DRAM either way) — the win is load time and residency.
+  Freed with `hipHostFree` (the device pointer is an alias, not a `hipMalloc`).
+
+- **First inference per server start pays a one-time HIP/COMGR kernel JIT.** It is
+  *not* cached across restarts and shows up as a large "prompt done" time even for
+  a trivial prompt. `--warm-weights` only faults mapped pages; it does **not**
+  compile kernels.
+
+- **rocm-smi "VRAM" is a red herring.** It reports only the ~512 MB BIOS UMA
+  carveout. Real weight residency lives in GTT (system RAM); watch `GPU use (%)`
+  and `free -g` instead.
 
 ## Debugging Notes
 
